@@ -1,4 +1,4 @@
-"""Pending AI poster: layered PSD + PNG + JPG (brown palette)."""
+"""Pending AI poster in an Apple-style Liquid Glass look: layered PSD + PNG + JPG."""
 import math
 import random
 import sys
@@ -13,17 +13,16 @@ OUT = Path(sys.argv[1])
 OUT.mkdir(parents=True, exist_ok=True)
 
 W, H = 2480, 3508  # A4, 300 dpi
-CX, CY = W // 2, 1330
+CX = W // 2
 FONT = "/usr/share/fonts/opentype/inter/"
-random.seed(7)
+rng = np.random.default_rng(11)
 
-BG = (20, 12, 8)
-CARAMEL = (214, 150, 82)
-COPPER = (176, 98, 52)
-TAN = (226, 190, 140)
-RUST = (150, 72, 38)
-CREAM = (248, 236, 218)
-MUTED = (196, 170, 142)
+BG = (22, 13, 8)
+AMBER = (232, 146, 64)
+BRONZE = (156, 80, 38)
+ROSE = (204, 118, 96)
+CREAM = (252, 232, 206)
+WHITE = (255, 255, 255)
 
 
 def font(name, size):
@@ -34,32 +33,19 @@ def blank():
     return Image.new("RGBA", (W, H), (0, 0, 0, 0))
 
 
-def mix(a, b, t):
+def lerp(a, b, t):
     return tuple(int(a[c] + (b[c] - a[c]) * t) for c in range(3))
 
 
-def gradient(w, h, stops, angle=0.0):
-    """Linear gradient; stops = [(pos, (r,g,b)), ...]."""
+def linear_gradient(w, h, stops, angle=90.0):
     y, x = np.mgrid[0:h, 0:w].astype(np.float32)
     a = math.radians(angle)
     t = x * math.cos(a) + y * math.sin(a)
-    t = (t - t.min()) / (t.max() - t.min())
-    pos = [s[0] for s in stops]
+    t = (t - t.min()) / max(t.max() - t.min(), 1e-6)
     out = np.zeros((h, w, 3), np.float32)
     for c in range(3):
-        out[..., c] = np.interp(t, pos, [s[1][c] for s in stops])
+        out[..., c] = np.interp(t, [s[0] for s in stops], [s[1][c] for s in stops])
     return out
-
-
-def text_fill(size, text, fnt, stops, angle=0.0, tracking=0):
-    """Gradient-filled text (RGBA, sized to the text)."""
-    mask = Image.new("L", size, 0)
-    d = ImageDraw.Draw(mask)
-    draw_tracked(d, (0, 0), text, fnt, 255, tracking)
-    g = gradient(size[0], size[1], stops, angle).astype(np.uint8)
-    img = Image.fromarray(g, "RGB").convert("RGBA")
-    img.putalpha(mask)
-    return img
 
 
 def tracked_width(text, fnt, tracking):
@@ -73,238 +59,340 @@ def draw_tracked(d, xy, text, fnt, fill, tracking=0):
         x += fnt.getlength(ch) + tracking
 
 
-def centered_text(layer, y, text, fnt, fill, tracking=0):
-    d = ImageDraw.Draw(layer)
-    x = (W - tracked_width(text, fnt, tracking)) / 2
-    draw_tracked(d, (x, y), text, fnt, fill, tracking)
+def gradient_text(text, fnt, stops, angle=90.0, tracking=0):
+    """Text filled with a gradient, sized to the text; returns (img, width)."""
+    tw = tracked_width(text, fnt, tracking)
+    h = fnt.getbbox(text)[3] + 20
+    mask = Image.new("L", (int(tw) + 20, h), 0)
+    draw_tracked(ImageDraw.Draw(mask), (0, 0), text, fnt, 255, tracking)
+    img = Image.fromarray(linear_gradient(mask.width, h, stops, angle).astype(np.uint8))
+    img = img.convert("RGBA")
+    img.putalpha(mask)
+    return img, tw
 
 
-layers = []  # (name, image, opacity, blend)
+def screen(base, top):
+    """Screen-blend an RGBA layer onto an RGB float array (0..1)."""
+    t = np.asarray(top, np.float32)
+    a = t[..., 3:] / 255
+    s = 1 - (1 - base) * (1 - t[..., :3] / 255)
+    return base * (1 - a) + s * a
 
-# 1. Background
-bg = gradient(W, H, [(0, (18, 11, 7)), (0.55, (46, 28, 17)), (1, (16, 10, 6))], 80)
+
+def over(base, top):
+    t = np.asarray(top, np.float32)
+    a = t[..., 3:] / 255
+    return base * (1 - a) + t[..., :3] / 255 * a
+
+
+def sample(img, xs, ys):
+    """Bilinear sample of an (h, w, 3) array at float coordinates."""
+    h, w = img.shape[:2]
+    xs = np.clip(xs, 0, w - 1.001)
+    ys = np.clip(ys, 0, h - 1.001)
+    x0, y0 = xs.astype(int), ys.astype(int)
+    fx, fy = (xs - x0)[..., None], (ys - y0)[..., None]
+    a = img[y0, x0] * (1 - fx) + img[y0, x0 + 1] * fx
+    b = img[y0 + 1, x0] * (1 - fx) + img[y0 + 1, x0 + 1] * fx
+    return a * (1 - fy) + b * fy
+
+
+def rrect_sdf(px, py, box, r):
+    x0, y0, x1, y1 = box
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    hx, hy = (x1 - x0) / 2 - r, (y1 - y0) / 2 - r
+    qx, qy = np.abs(px - cx) - hx, np.abs(py - cy) - hy
+    outside = np.hypot(np.maximum(qx, 0), np.maximum(qy, 0))
+    return outside + np.minimum(np.maximum(qx, qy), 0) - r
+
+
+def liquid_glass(scene, box, r, bezel=70, refract=1.0, frost=10, tint=(255, 246, 236),
+                 tint_amt=0.10, lift=0.05, shadow=0.35):
+    """Render a Liquid Glass panel over `scene` (H, W, 3 float 0..1); returns RGBA layer."""
+    pad = 140
+    x0, y0, x1, y1 = box
+    bx0, by0 = max(int(x0) - pad, 0), max(int(y0) - pad, 0)
+    bx1, by1 = min(int(x1) + pad, W), min(int(y1) + pad, H)
+    py, px = np.mgrid[by0:by1, bx0:bx1].astype(np.float32)
+    sdf = rrect_sdf(px + 0.5, py + 0.5, box, r)
+    gy, gx = np.gradient(sdf)
+    norm = np.hypot(gx, gy) + 1e-6
+    nx, ny = gx / norm, gy / norm  # outward normal
+
+    # Refraction: the bezel bends the backdrop like a convex lens edge.
+    d = np.clip(-sdf, 0, None)
+    t = np.clip(1 - d / bezel, 0, 1)
+    disp = refract * bezel * t ** 2.2
+    frosted = np.asarray(
+        Image.fromarray((scene * 255).astype(np.uint8)).filter(ImageFilter.GaussianBlur(frost)),
+        np.float32) / 255
+    col = sample(frosted, px - nx * disp, py - ny * disp)
+    # chromatic fringe on the bezel
+    col[..., 0] = sample(frosted, px - nx * disp * 1.06, py - ny * disp * 1.06)[..., 0]
+    col[..., 2] = sample(frosted, px - nx * disp * 0.94, py - ny * disp * 0.94)[..., 2]
+
+    lum = col.mean(axis=2, keepdims=True)
+    col = lum + (col - lum) * 1.18  # a touch more vivid, like Apple's glass
+    col = col * (1 - tint_amt) + np.array(tint, np.float32) / 255 * tint_amt + lift
+
+    # Specular rim: bright top-left, softer bottom-right, thin edge line all round.
+    lx, ly = -0.55, -0.83
+    facing = nx * lx + ny * ly
+    rim = np.exp(-d / 5.0)
+    wide = np.exp(-d / 26.0)
+    spec = (np.clip(facing, 0, 1) ** 1.5 * (0.85 * rim + 0.30 * wide)
+            + np.clip(-facing, 0, 1) ** 2 * (0.45 * rim + 0.12 * wide)
+            + 0.22 * rim)
+    col = col + spec[..., None] * (1 - col) * 1.0
+    # gentle top sheen
+    sheen = np.clip(1 - (py - y0) / ((y1 - y0) * 0.55), 0, 1) ** 2 * 0.06
+    col = np.clip(col + sheen[..., None], 0, 1)
+
+    alpha = np.clip(0.5 - sdf, 0, 1)
+
+    # Soft contact shadow beneath the glass
+    sh = Image.fromarray((np.clip(0.5 - rrect_sdf(px + 0.5, py - 26, box, r), 0, 1) * 255)
+                         .astype(np.uint8)).filter(ImageFilter.GaussianBlur(38))
+    sh_a = np.asarray(sh, np.float32) / 255 * shadow
+
+    out_a = alpha + sh_a * (1 - alpha)
+    shadow_col = np.array([10, 5, 2], np.float32) / 255
+    out_rgb = (col * alpha[..., None] + shadow_col * (sh_a * (1 - alpha))[..., None]) \
+        / np.maximum(out_a[..., None], 1e-6)
+    rgba = np.dstack([np.clip(out_rgb, 0, 1) * 255, out_a * 255]).astype(np.uint8)
+    layer = blank()
+    layer.paste(Image.fromarray(rgba, "RGBA"), (bx0, by0))
+    return layer
+
+
+def supersample(size, draw_fn, scale=4):
+    """Draw at `scale`x and downsample for smooth anti-aliased shapes."""
+    big = Image.new("RGBA", (size[0] * scale, size[1] * scale), (0, 0, 0, 0))
+    draw_fn(ImageDraw.Draw(big), scale)
+    return big.resize(size, Image.LANCZOS)
+
+
+layers = []  # (name, image, blend)
+
+# 1. Background: warm mesh gradient + grain
 y, x = np.mgrid[0:H, 0:W].astype(np.float32)
-vign = 1 - 0.55 * np.clip(np.hypot((x - CX) / W, (y - CY) / H) * 1.6, 0, 1) ** 2
-bg = np.clip(bg * vign[..., None], 0, 255).astype(np.uint8)
-layers.append(("Background", Image.fromarray(bg, "RGB").convert("RGBA"), 255, BlendMode.NORMAL))
-
-# 2. Grid
-grid = blank()
-d = ImageDraw.Draw(grid)
-step = 124
-for gx in range(0, W + 1, step):
-    d.line([(gx, 0), (gx, H)], fill=TAN + (22,), width=2)
-for gy in range(0, H + 1, step):
-    d.line([(0, gy), (W, gy)], fill=TAN + (22,), width=2)
-fade = np.clip(1 - np.hypot((x - CX) / (W * 0.75), (y - CY) / (H * 0.55)), 0, 1)
-ga = np.array(grid)
-ga[..., 3] = (ga[..., 3] * fade).astype(np.uint8)
-layers.append(("Grid", Image.fromarray(ga, "RGBA"), 255, BlendMode.NORMAL))
-
-# 3. Glow
-glow = blank()
-d = ImageDraw.Draw(glow)
-for (gx, gy, r, col, a) in [
-    (CX - 520, CY - 380, 620, COPPER, 120),
-    (CX + 560, CY + 260, 560, CARAMEL, 90),
-    (CX + 200, CY - 700, 380, RUST, 80),
-    (CX - 700, 2900, 520, COPPER, 60),
-    (CX + 760, 3150, 460, CARAMEL, 45),
+bg = linear_gradient(W, H, [(0, (40, 23, 14)), (0.5, (26, 15, 9)), (1, (14, 8, 5))], 90) / 255
+blobs = blank()
+d = ImageDraw.Draw(blobs)
+for (bx, by, r, c, a) in [
+    (380, 820, 760, AMBER, 230), (2150, 620, 640, ROSE, 200),
+    (2000, 1850, 720, BRONZE, 220), (1240, 1260, 420, CREAM, 150),
+    (300, 2250, 620, BRONZE, 170), (2300, 2900, 620, AMBER, 140),
+    (700, 3300, 560, ROSE, 110), (1240, 2350, 900, (60, 32, 18), 200),
 ]:
-    d.ellipse([gx - r, gy - r, gx + r, gy + r], fill=col + (a,))
-glow = glow.filter(ImageFilter.GaussianBlur(220))
-layers.append(("Glow", glow, 255, BlendMode.SCREEN))
+    d.ellipse([bx - r, by - r, bx + r, by + r], fill=c + (a,))
+blobs = blobs.filter(ImageFilter.GaussianBlur(260))
+bg = over(bg, blobs)
+bg = np.clip(bg + rng.normal(0, 0.012, (H, W, 1)).astype(np.float32), 0, 1)
+layers.append(("Background", Image.fromarray((bg * 255).astype(np.uint8)).convert("RGBA"),
+               BlendMode.NORMAL))
 
-# 4. Neural network
-net = blank()
-d = ImageDraw.Draw(net)
-cols = [260, 640, 1840, 2220]
-nodes = []
-for i, nx in enumerate(cols):
-    n = 5 if i in (0, 3) else 4
-    ys = np.linspace(CY - 620, CY + 620, n)
-    nodes.append([(nx + random.randint(-40, 40), int(ny)) for ny in ys])
-for a, b in [(0, 1), (2, 3)]:
-    for p in nodes[a]:
-        for q in nodes[b]:
-            if random.random() < 0.8:
-                d.line([p, q], fill=TAN + (55,), width=3)
-for layer_nodes in (nodes[1], nodes[2]):  # links into the centre
-    for p in layer_nodes:
-        ang = math.atan2(p[1] - CY, p[0] - CX)
-        q = (CX + 600 * math.cos(ang), CY + 600 * math.sin(ang))
-        d.line([p, q], fill=CARAMEL + (75,), width=3)
-for k, layer_nodes in enumerate(nodes):
-    col = CARAMEL if k % 2 else COPPER
-    for (px, py) in layer_nodes:
-        d.ellipse([px - 26, py - 26, px + 26, py + 26], outline=col + (220,), width=5)
-        d.ellipse([px - 11, py - 11, px + 11, py + 11], fill=col + (255,))
-for _ in range(260):  # particles
-    px, py = random.randint(0, W), random.randint(0, H)
-    r = random.choice([2, 2, 3, 4])
-    d.ellipse([px - r, py - r, px + r, py + r], fill=TAN + (random.randint(40, 150),))
-net = Image.alpha_composite(net.filter(ImageFilter.GaussianBlur(10)), net)
-layers.append(("Neural network", net, 255, BlendMode.NORMAL))
+# 2. Silk ribbons: flowing light that the glass refracts
+def ribbons_fn(dr, s):
+    xs = np.linspace(-200, W + 200, 400)
+    specs = [(1150, 260, 0.0021, 0.4, 110, (255, 200, 140, 120)),
+             (1320, 220, 0.0024, 1.9, 46, (255, 230, 200, 150)),
+             (980, 300, 0.0018, 2.8, 70, (230, 140, 90, 110)),
+             (1500, 180, 0.0027, 4.1, 26, (255, 240, 220, 170)),
+             (2950, 160, 0.0020, 1.2, 60, (240, 160, 100, 80))]
+    for (y0, amp, f, ph, wdt, c) in specs:
+        pts = [(xx * s, (y0 + amp * math.sin(xx * f + ph) + 0.08 * amp * math.sin(xx * f * 3.1)) * s)
+               for xx in xs]
+        dr.line(pts, fill=c, width=int(wdt * s), joint="curve")
 
-# 5. "Pending" loading ring
-ring = blank()
-d = ImageDraw.Draw(ring)
-R = 560
-d.ellipse([CX - R, CY - R, CX + R, CY + R], outline=TAN + (60,), width=6)
-segs, filled = 60, 43
-for i in range(segs):
-    a0 = -90 + i * 360 / segs + 1.2
-    a1 = a0 + 360 / segs - 2.4
-    col = mix(RUST, TAN, i / filled) + (255,) if i < filled else (90, 62, 44, 120)
-    r2 = R - 40
-    d.arc([CX - r2, CY - r2, CX + r2, CY + r2], a0, a1, fill=col, width=46)
-r3 = R - 110
-d.ellipse([CX - r3, CY - r3, CX + r3, CY + r3], outline=CARAMEL + (90,), width=4)
-for i in range(120):  # tick marks
-    a = math.radians(i * 3)
-    r_in, r_out = (r3 - 34, r3 - 12) if i % 10 else (r3 - 52, r3 - 12)
-    d.line([(CX + r_in * math.cos(a), CY + r_in * math.sin(a)),
-            (CX + r_out * math.cos(a), CY + r_out * math.sin(a))],
-           fill=TAN + (90 if i % 10 else 180,), width=3)
-ea = math.radians(-90 + filled * 360 / segs)  # bright dot at the arc tip
-ex, ey = CX + (R - 40) * math.cos(ea), CY + (R - 40) * math.sin(ea)
-d.ellipse([ex - 34, ey - 34, ex + 34, ey + 34], fill=CREAM + (255,))
-ring = Image.alpha_composite(ring.filter(ImageFilter.GaussianBlur(18)), ring)
-layers.append(("Loading ring", ring, 255, BlendMode.NORMAL))
+ribbons = supersample((W, H), ribbons_fn, scale=1).filter(ImageFilter.GaussianBlur(22))
+layers.append(("Silk ribbons", ribbons, BlendMode.SCREEN))
+scene = screen(bg, ribbons)
 
-# 6. AI chip
-chip = blank()
-d = ImageDraw.Draw(chip)
-cs = 250
-for i in range(-3, 4):  # chip pins
-    o = i * 64
-    for (x0, y0, x1, y1) in [
-        (CX + o - 12, CY - cs - 70, CX + o + 12, CY - cs),
-        (CX + o - 12, CY + cs, CX + o + 12, CY + cs + 70),
-        (CX - cs - 70, CY + o - 12, CX - cs, CY + o + 12),
-        (CX + cs, CY + o - 12, CX + cs + 70, CY + o + 12),
-    ]:
-        d.rounded_rectangle([x0, y0, x1, y1], 6, fill=TAN + (230,))
-body = gradient(2 * cs, 2 * cs, [(0, (70, 42, 24)), (1, (32, 19, 11))], 45).astype(np.uint8)
-body_img = Image.fromarray(body, "RGB").convert("RGBA")
-m = Image.new("L", (2 * cs, 2 * cs), 0)
-ImageDraw.Draw(m).rounded_rectangle([0, 0, 2 * cs - 1, 2 * cs - 1], 60, fill=255)
-body_img.putalpha(m)
-chip.alpha_composite(body_img, (CX - cs, CY - cs))
-d = ImageDraw.Draw(chip)
-d.rounded_rectangle([CX - cs, CY - cs, CX + cs, CY + cs], 60, outline=CARAMEL + (255,), width=8)
-d.rounded_rectangle([CX - cs + 40, CY - cs + 40, CX + cs - 40, CY + cs - 40], 36,
-                    outline=COPPER + (170,), width=4)
-f_ai = font("InterDisplay-Black.otf", 250)
-bb = d.textbbox((0, 0), "AI", font=f_ai)
-tw, th = bb[2] - bb[0], bb[3] - bb[1]
-ai_txt = text_fill((tw + 20, th + bb[1] + 20), "AI", f_ai, [(0, CREAM), (1, CARAMEL)], 30)
-chip.alpha_composite(ai_txt, (int(CX - tw / 2 - bb[0]), int(CY - th / 2 - bb[1])))
-chip = Image.alpha_composite(chip.filter(ImageFilter.GaussianBlur(14)), chip)
-layers.append(("AI chip", chip, 255, BlendMode.NORMAL))
+# 3. Hero glass orb
+OCX, OCY, OR = CX, 1230, 600
+orb = liquid_glass(scene, (OCX - OR, OCY - OR, OCX + OR, OCY + OR), OR, bezel=130,
+                   refract=1.35, frost=14, tint=(60, 34, 20), tint_amt=0.18, lift=0.02)
+layers.append(("Glass orb", orb, BlendMode.NORMAL))
 
-# 7. Top label
-top = blank()
-f_lab = font("Inter-SemiBold.otf", 54)
-label = "ARTIFICIAL INTELLIGENCE PROJECT"
-lw = tracked_width(label, f_lab, 14)
-d = ImageDraw.Draw(top)
-d.rounded_rectangle([(W - lw) / 2 - 60, 230, (W + lw) / 2 + 60, 340], 55,
-                    outline=CARAMEL + (200,), width=4, fill=CARAMEL + (22,))
-centered_text(top, 252, label, f_lab, TAN + (255,), 14)
-layers.append(("Top label", top, 255, BlendMode.NORMAL))
+# 4. Progress ring (Apple Activity-style, round caps, conic gradient)
+RR, RW, PROG = 470, 46, 0.72
+py_, px_ = np.mgrid[0:H, 0:W].astype(np.float32)
+dx, dy = px_ - OCX, py_ - OCY
+rad = np.hypot(dx, dy)
+ang = (np.degrees(np.arctan2(dx, -dy)) % 360) / 360  # 0 at 12 o'clock, clockwise
+band = np.clip(RW / 2 + 0.5 - np.abs(rad - RR), 0, 1)
+track_a = band * 0.16
+end = PROG * 2 * math.pi
+caps = []
+for a_ in (0.0, end):
+    cxp, cyp = OCX + RR * math.sin(a_), OCY - RR * math.cos(a_)
+    caps.append(np.clip(RW / 2 + 0.5 - np.hypot(px_ - cxp, py_ - cyp), 0, 1))
+prog_a = np.maximum(band * (ang <= PROG), np.maximum(caps[0], caps[1]))
+t = np.clip(ang / PROG, 0, 1)
+t = np.where(caps[1] > 0, 1.0, np.where((caps[0] > 0) & (ang > PROG), 0.0, t))
+stops = [(0, (186, 92, 46)), (0.5, AMBER), (1, (255, 226, 180))]
+ring_rgb = np.dstack([np.interp(t, [s[0] for s in stops], [s[1][c] for s in stops])
+                      for c in range(3)])
+ring_a = np.maximum(prog_a, track_a)
+ring_rgb = np.where((prog_a > 0)[..., None], ring_rgb, 255)
+ring = Image.fromarray(np.dstack([ring_rgb, ring_a * 255]).astype(np.uint8), "RGBA")
+ring_glow = Image.fromarray(np.dstack([ring_rgb, prog_a * 140]).astype(np.uint8), "RGBA")
+ring = Image.alpha_composite(ring_glow.filter(ImageFilter.GaussianBlur(28)), ring)
+del py_, px_, dx, dy, rad, ang, band, caps, prog_a, t, ring_rgb, ring_a
+layers.append(("Progress ring", ring, BlendMode.NORMAL))
 
-# 8. Title
+# 5. AI mark inside the orb
+mark = blank()
+f_ai = font("InterDisplay-SemiBold.otf", 300)
+ai_img, ai_w = gradient_text("AI", f_ai, [(0, WHITE), (1, (255, 226, 190))], 90, -6)
+bb = f_ai.getbbox("AI")
+mark.alpha_composite(ai_img, (int(OCX - ai_w / 2), int(OCY - (bb[1] + bb[3]) / 2 - 40)))
+f_cap = font("Inter-Medium.otf", 52)
+cap = "Thinking…"
+ImageDraw.Draw(mark).text((OCX - f_cap.getlength(cap) / 2, OCY + 150), cap, font=f_cap,
+                          fill=(255, 240, 225, 175))
+layers.append(("AI mark", mark, BlendMode.NORMAL))
+
+# 6. Top pill
+f_pill = font("Inter-Medium.otf", 48)
+pill_txt = "Artificial Intelligence Project"
+pw = f_pill.getlength(pill_txt) + 70 + 150
+pill_box = (CX - pw / 2, 250, CX + pw / 2, 380)
+layers.append(("Top pill glass", liquid_glass(scene, pill_box, 65, bezel=34, refract=0.9,
+                                              frost=8, shadow=0.25), BlendMode.NORMAL))
+pill = blank()
+d = ImageDraw.Draw(pill)
+dot_x = pill_box[0] + 75
+d.ellipse([dot_x - 15, 315 - 15, dot_x + 15, 315 + 15], fill=AMBER + (255,))
+pill_glow = blank()
+ImageDraw.Draw(pill_glow).ellipse([dot_x - 26, 289, dot_x + 26, 341], fill=AMBER + (160,))
+pill = Image.alpha_composite(pill_glow.filter(ImageFilter.GaussianBlur(10)), pill)
+ImageDraw.Draw(pill).text((dot_x + 45, 286), pill_txt, font=f_pill, fill=WHITE + (240,))
+layers.append(("Top pill text", pill, BlendMode.NORMAL))
+
+# 7. Title
 title = blank()
-f_title = font("InterDisplay-Black.otf", 380)
-trk = 6
-w1 = tracked_width("PENDING", f_title, trk)
-gap_w = f_title.getlength(" ") * 0.9
-w2 = tracked_width("AI", f_title, trk)
-th = f_title.getbbox("PENDING")[3] + 40
-tx, ty = int((W - (w1 + gap_w + w2)) / 2), 2060
-t1 = text_fill((int(w1) + 40, th), "PENDING", f_title, [(0, CREAM), (1, (236, 214, 184))], 0, trk)
-t2 = text_fill((int(w2) + 40, th), "AI", f_title, [(0, CARAMEL), (1, COPPER)], 20, trk)
-words = blank()
-words.alpha_composite(t1, (tx, ty))
-words.alpha_composite(t2, (int(tx + w1 + gap_w), ty))
-shadow = Image.new("RGBA", (W, H), COPPER + (0,))
-shadow.putalpha(words.getchannel("A").point(lambda v: v * 0.7))
-title.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(45)))
-title.alpha_composite(words)
-layers.append(("Title - PENDING AI", title, 255, BlendMode.NORMAL))
+f_title = font("InterDisplay-Bold.otf", 330)
+p_img, p_w = gradient_text("Pending", f_title, [(0, WHITE), (1, (250, 236, 220))], 90, -9)
+a_img, a_w = gradient_text("AI", f_title, [(0, (255, 214, 150)), (0.55, AMBER), (1, ROSE)],
+                           25, -9)
+space = f_title.getlength(" ") * 0.85
+tx, ty = int(CX - (p_w + space + a_w) / 2), 2010
+title.alpha_composite(p_img, (tx, ty))
+title.alpha_composite(a_img, (int(tx + p_w + space), ty))
+glow = Image.new("RGBA", (W, H), AMBER + (0,))
+glow.putalpha(title.getchannel("A").point(lambda v: v * 0.35))
+title = Image.alpha_composite(glow.filter(ImageFilter.GaussianBlur(60)), title)
+layers.append(("Title", title, BlendMode.NORMAL))
 
-# 9. Tagline
-sub = blank()
-f_sub = font("Inter-Light.otf", 92)
-centered_text(sub, 2520, "The future is loading…", f_sub, CREAM + (235,), 2)
-d = ImageDraw.Draw(sub)
-for i, col in enumerate([RUST, COPPER, CARAMEL]):  # three dots
-    px = CX - 60 + i * 60
-    d.ellipse([px - 12, 2690 - 12, px + 12, 2690 + 12], fill=col + (255,))
-layers.append(("Tagline", sub, 255, BlendMode.NORMAL))
+# 8. Tagline
+tag = blank()
+f_tag = font("Inter-Regular.otf", 86)
+tag_txt = "The future is loading."
+ImageDraw.Draw(tag).text((CX - f_tag.getlength(tag_txt) / 2, 2420), tag_txt, font=f_tag,
+                         fill=(255, 240, 226, 200))
+layers.append(("Tagline", tag, BlendMode.NORMAL))
 
-# 10. Features
-feat = blank()
-d = ImageDraw.Draw(feat)
+# 9. Feature cards (glass) + content
 cards = [
-    ("01", "Machine Learning", ["Smart models that", "learn from data"]),
-    ("02", "Neural Networks", ["Architecture inspired", "by the human brain"]),
-    ("03", "Smart Solutions", ["Practical applications", "for real problems"]),
+    ("Machine Learning", ["Smart models that", "learn from data"], "bars"),
+    ("Neural Networks", ["Architecture inspired", "by the human brain"], "nodes"),
+    ("Smart Solutions", ["Practical answers", "to real problems"], "sparkle"),
 ]
-cw, chh, gap = 680, 380, 60
+cw, ch, gap, cy0 = 690, 480, 50, 2680
 x0 = (W - (3 * cw + 2 * gap)) // 2
-cy0 = 2800
-f_num = font("InterDisplay-Bold.otf", 64)
-f_h = font("Inter-Bold.otf", 58)
-f_p = font("Inter-Regular.otf", 42)
-for i, (num, head, lines) in enumerate(cards):
+card_glass = blank()
+for i in range(3):
     cx0 = x0 + i * (cw + gap)
-    accent = [COPPER, CARAMEL, TAN][i]
-    d.rounded_rectangle([cx0, cy0, cx0 + cw, cy0 + chh], 40,
-                        fill=(255, 240, 220, 14), outline=accent + (150,), width=3)
-    d.rounded_rectangle([cx0 + 50, cy0, cx0 + 170, cy0 + 8], 4, fill=accent + (255,))
-    d.text((cx0 + 50, cy0 + 50), num, font=f_num, fill=accent + (255,))
-    d.text((cx0 + 50, cy0 + 145), head, font=f_h, fill=CREAM + (255,))
-    for j, ln in enumerate(lines):
-        d.text((cx0 + 50, cy0 + 232 + j * 56), ln, font=f_p, fill=MUTED + (255,))
-layers.append(("Features", feat, 255, BlendMode.NORMAL))
+    card_glass.alpha_composite(liquid_glass(scene, (cx0, cy0, cx0 + cw, cy0 + ch), 64,
+                                            bezel=46, refract=1.0, frost=12, shadow=0.3))
+layers.append(("Card glass", card_glass, BlendMode.NORMAL))
 
-# 11. Footer
+
+def icon_base(size=136):
+    """App-icon style squircle with a warm gradient."""
+    sq = supersample((size, size), lambda dr, s: dr.rounded_rectangle(
+        [0, 0, size * s - 1, size * s - 1], int(size * s * 0.28), fill=(255, 255, 255, 255)))
+    grad = Image.fromarray(linear_gradient(size, size, [(0, (250, 180, 100)), (1, BRONZE)],
+                                           60).astype(np.uint8)).convert("RGBA")
+    grad.putalpha(sq.getchannel("A"))
+    return grad
+
+
+content = blank()
+d = ImageDraw.Draw(content)
+f_h = font("Inter-SemiBold.otf", 58)
+f_p = font("Inter-Regular.otf", 42)
+
+
+def glyph(kind, size=136):
+    """White glyph only (transparent background)."""
+    def fn(dr, s):
+        S = size * s
+        w_ = (255, 255, 255, 255)
+        if kind == "bars":
+            for k, hgt in enumerate([0.30, 0.48, 0.66]):
+                bx = S * (0.24 + k * 0.19)
+                dr.rounded_rectangle([bx, S * (0.78 - hgt), bx + S * 0.13, S * 0.78],
+                                     int(S * 0.04), fill=w_)
+        elif kind == "nodes":
+            pts = [(px * S, py * S) for px, py in [(0.5, 0.26), (0.27, 0.70), (0.73, 0.70)]]
+            for a_, b_ in [(0, 1), (1, 2), (2, 0)]:
+                dr.line([pts[a_], pts[b_]], fill=w_, width=int(S * 0.05))
+            for (px, py) in pts:
+                r_ = S * 0.095
+                dr.ellipse([px - r_, py - r_, px + r_, py + r_], fill=w_)
+        else:
+            c_, R_, r_ = S / 2, S * 0.32, S * 0.075
+            star = []
+            for k in range(8):
+                rr = R_ if k % 2 == 0 else r_
+                a_ = math.radians(k * 45 - 90)
+                star.append((c_ + rr * math.cos(a_), c_ + rr * math.sin(a_)))
+            dr.polygon(star, fill=w_)
+    return supersample((size, size), fn)
+
+
+for i, (head, lines, kind) in enumerate(cards):
+    cx0 = x0 + i * (cw + gap)
+    ic = icon_base()
+    ic.alpha_composite(glyph(kind))
+    content.alpha_composite(ic, (cx0 + 56, cy0 + 56))
+    d.text((cx0 + 56, cy0 + 236), head, font=f_h, fill=WHITE + (255,))
+    for j, ln in enumerate(lines):
+        d.text((cx0 + 56, cy0 + 322 + j * 54), ln, font=f_p, fill=(255, 238, 222, 185))
+layers.append(("Card content", content, BlendMode.NORMAL))
+
+# 10. Footer capsule
+fbox = (160, 3270, W - 160, 3410)
+layers.append(("Footer glass", liquid_glass(scene, fbox, 70, bezel=36, refract=0.9, frost=10,
+                                            shadow=0.25), BlendMode.NORMAL))
 foot = blank()
 d = ImageDraw.Draw(foot)
-d.line([(160, 3300), (W - 160, 3300)], fill=TAN + (70,), width=2)
-f_ft = font("Inter-Medium.otf", 46)
-f_ftb = font("Inter-SemiBold.otf", 46)
-d.text((160, 3345), "Author: ", font=f_ft, fill=MUTED + (255,))
-d.text((160 + f_ft.getlength("Author: "), 3345), "Rashid Dursunov", font=f_ftb, fill=CREAM + (255,))
-right = "2026"
-d.text((W - 160 - f_ft.getlength(right), 3345), right, font=f_ft, fill=MUTED + (255,))
-layers.append(("Footer", foot, 255, BlendMode.NORMAL))
+f_lbl = font("Inter-Regular.otf", 44)
+f_nm = font("Inter-SemiBold.otf", 46)
+d.text((235, 3312), "Author", font=f_lbl, fill=(255, 238, 222, 170))
+d.text((235 + f_lbl.getlength("Author") + 26, 3311), "Rashid Dursunov", font=f_nm,
+       fill=WHITE + (255,))
+yr = "2026"
+d.text((W - 235 - f_nm.getlength(yr), 3311), yr, font=f_nm, fill=WHITE + (235,))
+layers.append(("Footer text", foot, BlendMode.NORMAL))
 
 # --- Build the PSD ---
 psd = PSDImage.new("RGB", (W, H), color=BG)
-for name, img, op, blend in layers:
+for name, img, blend in layers:
     bbox = img.getchannel("A").getbbox()
-    if not bbox:
-        continue
-    psd.create_pixel_layer(img.crop(bbox), name=name, left=bbox[0], top=bbox[1],
-                           opacity=op, blend_mode=blend)
+    if bbox:
+        psd.create_pixel_layer(img.crop(bbox), name=name, left=bbox[0], top=bbox[1],
+                               blend_mode=blend)
 psd.save(OUT / "pending_ai_poster.psd")
 
-# Flattened preview (PNG/JPG) - Screen blend applied by hand
-comp = Image.new("RGBA", (W, H), BG + (255,))
-for name, img, op, blend in layers:
-    if blend == BlendMode.SCREEN:
-        base = np.asarray(comp, np.float32)[..., :3] / 255
-        top_ = np.asarray(img, np.float32)
-        a = top_[..., 3:] / 255
-        scr = 1 - (1 - base) * (1 - top_[..., :3] / 255)
-        out = base * (1 - a) + scr * a
-        comp = Image.fromarray((out * 255).astype(np.uint8), "RGB").convert("RGBA")
-    else:
-        comp = Image.alpha_composite(comp, img)
-comp = comp.convert("RGB")
+# Flattened preview
+comp = np.zeros((H, W, 3), np.float32)
+for name, img, blend in layers:
+    comp = screen(comp, img) if blend == BlendMode.SCREEN else over(comp, img)
+comp = Image.fromarray((np.clip(comp, 0, 1) * 255).astype(np.uint8))
 comp.save(OUT / "pending_ai_poster.png", dpi=(300, 300))
 comp.save(OUT / "pending_ai_poster.jpg", quality=92, dpi=(300, 300))
 print("ok")

@@ -172,6 +172,76 @@ def supersample(size, draw_fn, scale=4):
     return big.resize(size, Image.LANCZOS)
 
 
+P_LIGHT = (246, 222, 188)
+P_MID = (222, 176, 122)
+P_DEEP = (176, 120, 72)
+
+
+def tailed_p(size, ss=3):
+    """Custom 'P' in light brown tones whose stem flows into a twisted, curling ribbon tail.
+
+    Returns (image, origin_x, advance): draw the image at (x - origin_x, y) to put the
+    glyph's text origin at (x, y), same as ImageDraw.text would.
+    """
+    S = size * ss
+    f = font("InterDisplay-Bold.otf", S)
+    adv = f.getlength("P")
+    bb = f.getbbox("P")
+    stem = S * 0.19
+    ox = int(stem * 5.0)
+    cw, ch = int(ox + adv + stem), int(bb[3] + stem * 4.2)
+    gmask = Image.new("L", (cw, ch), 0)
+    ImageDraw.Draw(gmask).text((ox, 0), "P", font=f, fill=255)
+    m = np.asarray(gmask) > 128
+    yb = bb[3] - 3
+    cols = np.nonzero(m[yb])[0]
+    xl = cols[0]
+    xr = xl
+    while xr + 1 < cw and m[yb, xr + 1]:
+        xr += 1
+    s = xr - xl + 1
+    cxs = (xl + xr) / 2
+
+    fill = Image.fromarray(linear_gradient(cw, ch, [(0, P_LIGHT), (0.75, P_MID), (1, P_DEEP)],
+                                           90).astype(np.uint8)).convert("RGBA")
+    fill.putalpha(gmask)
+    img = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+    img.alpha_composite(fill)
+
+    # Tail centre-line: a descender straight out of the stem, then a wide inward
+    # spiral sweeping to the left.
+    pts = []
+    drop = s * 0.8
+    for k in range(120):  # starts inside the stem so the join is seamless
+        pts.append((cxs, yb - s + k / 119 * (s + drop)))
+    R0 = s * 1.9
+    C = (cxs - R0, yb + drop)
+    turns = 1.3
+    for k in range(1, 2400):
+        th = k / 2399 * turns * 2 * math.pi
+        R = R0 * (1 - 0.68 * th / (turns * 2 * math.pi))
+        pts.append((C[0] + R * math.cos(th), C[1] + R * math.sin(th)))
+    n = len(pts)
+    t0 = 120 / n  # where the spiral (and the twisting) begins
+    d = ImageDraw.Draw(img)
+    stem_col = tuple(int(v) for v in np.asarray(fill)[yb, int(cxs), :3])
+    twists = 3  # half-turns of the ribbon along the spiral
+    for i, (px, py) in enumerate(pts):
+        t = i / (n - 1)
+        u = max(t - t0, 0) / (1 - t0)
+        taper = 1 - 0.8 * u ** 0.9
+        face = math.cos(u * twists * math.pi)
+        r = s / 2 * taper * (0.2 + 0.8 * abs(face))
+        shade = 0.5 + 0.5 * face  # front face light, back face deeper brown
+        col = lerp(P_DEEP, P_LIGHT, 0.2 + 0.8 * shade)
+        if u < 0.08:
+            col = lerp(stem_col, col, u / 0.08)
+        d.ellipse([px - r, py - r, px + r, py + r], fill=col + (255,))
+    img.alpha_composite(fill)  # keep the bowl/stem crisp above the tail start
+    out = img.resize((cw // ss, ch // ss), Image.LANCZOS)
+    return out, ox / ss, adv / ss
+
+
 layers = []  # (name, image, blend)
 
 # 1. Background: warm mesh gradient + grain
@@ -242,17 +312,18 @@ ring = Image.alpha_composite(ring_glow.filter(ImageFilter.GaussianBlur(28)), rin
 del py_, px_, dx, dy, rad, ang, band, caps, prog_a, t, ring_rgb, ring_a
 layers.append(("Progress ring", ring, BlendMode.NORMAL))
 
-# 5. AI mark inside the orb
+# 5. Logo inside the orb: the tailed P
 mark = blank()
-f_ai = font("InterDisplay-SemiBold.otf", 300)
-ai_img, ai_w = gradient_text("AI", f_ai, [(0, WHITE), (1, (255, 226, 190))], 90, -6)
-bb = f_ai.getbbox("AI")
-mark.alpha_composite(ai_img, (int(OCX - ai_w / 2), int(OCY - (bb[1] + bb[3]) / 2 - 40)))
-f_cap = font("Inter-Medium.otf", 52)
-cap = "Thinking…"
-ImageDraw.Draw(mark).text((OCX - f_cap.getlength(cap) / 2, OCY + 150), cap, font=f_cap,
-                          fill=(255, 240, 225, 175))
-layers.append(("AI mark", mark, BlendMode.NORMAL))
+logo, _, _ = tailed_p(500)
+lb = logo.getchannel("A").getbbox()
+logo = logo.crop(lb)
+shadow = Image.new("RGBA", (W, H), (20, 10, 4, 0))
+pos = (int(OCX - logo.width / 2 + 20), int(OCY - logo.height / 2))
+mark.alpha_composite(logo, pos)
+shadow.putalpha(mark.getchannel("A").point(lambda v: v * 0.45))
+shadow = shadow.transform(shadow.size, Image.AFFINE, (1, 0, 0, 0, 1, -14))
+mark = Image.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(24)), mark)
+layers.append(("Logo P", mark, BlendMode.NORMAL))
 
 # 6. Top pill
 f_pill = font("Inter-Medium.otf", 48)
@@ -274,12 +345,15 @@ layers.append(("Top pill text", pill, BlendMode.NORMAL))
 # 7. Title
 title = blank()
 f_title = font("InterDisplay-Bold.otf", 330)
-p_img, p_w = gradient_text("Pending", f_title, [(0, WHITE), (1, (250, 236, 220))], 90, -9)
+cap_p, cap_ox, cap_adv = tailed_p(330)
+e_img, e_w = gradient_text("ending", f_title, [(0, WHITE), (1, (250, 236, 220))], 90, -9)
 a_img, a_w = gradient_text("AI", f_title, [(0, (255, 214, 150)), (0.55, AMBER), (1, ROSE)],
                            25, -9)
 space = f_title.getlength(" ") * 0.85
-tx, ty = int(CX - (p_w + space + a_w) / 2), 2010
-title.alpha_composite(p_img, (tx, ty))
+p_w = cap_adv - 9 + e_w
+tx, ty = int(CX - (p_w + space + a_w) / 2), 1990
+title.alpha_composite(cap_p, (int(tx - cap_ox), ty))
+title.alpha_composite(e_img, (int(tx + cap_adv - 9), ty))
 title.alpha_composite(a_img, (int(tx + p_w + space), ty))
 glow = Image.new("RGBA", (W, H), AMBER + (0,))
 glow.putalpha(title.getchannel("A").point(lambda v: v * 0.35))
@@ -290,7 +364,7 @@ layers.append(("Title", title, BlendMode.NORMAL))
 tag = blank()
 f_tag = font("Inter-Regular.otf", 86)
 tag_txt = "The future is loading."
-ImageDraw.Draw(tag).text((CX - f_tag.getlength(tag_txt) / 2, 2420), tag_txt, font=f_tag,
+ImageDraw.Draw(tag).text((CX - f_tag.getlength(tag_txt) / 2, 2440), tag_txt, font=f_tag,
                          fill=(255, 240, 226, 200))
 layers.append(("Tagline", tag, BlendMode.NORMAL))
 
@@ -396,3 +470,11 @@ comp = Image.fromarray((np.clip(comp, 0, 1) * 255).astype(np.uint8))
 comp.save(OUT / "pending_ai_poster.png", dpi=(300, 300))
 comp.save(OUT / "pending_ai_poster.jpg", quality=92, dpi=(300, 300))
 print("ok")
+
+# Standalone logo (transparent PNG)
+logo_big, _, _ = tailed_p(1400)
+logo_big = logo_big.crop(logo_big.getchannel("A").getbbox())
+pad = 120
+canvas = Image.new("RGBA", (logo_big.width + 2 * pad, logo_big.height + 2 * pad), (0, 0, 0, 0))
+canvas.alpha_composite(logo_big, (pad, pad))
+canvas.save(OUT / "pending_ai_logo.png")
